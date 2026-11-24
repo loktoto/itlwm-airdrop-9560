@@ -1,0 +1,408 @@
+/*
+ * Copyright (C) 2020  钟先耀
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+#ifdef AIRPORT_WCL
+#include "../../AirportItlwm/WCL/WCL.hpp"
+#endif
+#include "ItlIwx.hpp"
+#include "if_iwxapi86.h"
+#include <net80211/ieee80211_priv.h>
+
+static constexpr uint8_t IWL_SCAN_DWELL_ACTIVE = 10;
+static constexpr uint8_t IWL_SCAN_DWELL_PASSIVE = 110;
+static constexpr uint8_t IWL_SCAN_NUM_OF_FRAGS = 3;
+static constexpr uint8_t IWX_SCAN_ADWELL_DEFAULT_N_APS_SOCIAL = 10;
+static constexpr uint8_t IWX_SCAN_ADWELL_DEFAULT_LB_N_APS = 2;
+static constexpr uint8_t IWX_SCAN_ADWELL_DEFAULT_HB_N_APS = 8;
+static constexpr uint16_t IWX_SCAN_ADWELL_MAX_BUDGET_DIRECTED_SCAN = 100;
+static constexpr uint16_t IWX_SCAN_ADWELL_MAX_BUDGET_FULL_SCAN = 300;
+static constexpr uint8_t IWX_SCAN_ADWELL_N_APS_GO_FRIENDLY = 10;
+static constexpr uint8_t IWX_SCAN_ADWELL_N_APS_SOCIAL_CHS = 2;
+
+/* General parameters of a v17 UMAC scan, after iwl_mvm_scan_umac_fill_general_p_v12(). */
+static void
+iwx_umac_scan_v17_fill_general(struct iwx_softc *sc,
+    struct iwx_api86_scan_general *general_params, int bgscan, bool scanActive,
+    bool directed)
+{
+    uint16_t gen_flags = 0;
+#ifdef AIRPORT_WCL
+    struct ieee80211com *ic = &sc->sc_ic;
+    const auto timing = AirportWCL::scanTiming(ic->ic_wcl_scan_away_time_ms, bgscan,
+        isset(sc->sc_ucode_api, IWX_UCODE_TLV_API_FRAGMENTED_SCAN));
+    const uint32_t timeout = htole32(timing.suspendTU);
+    const uint32_t maxOut = htole32(timing.maxOutTU);
+#else
+    const uint32_t timeout = bgscan ?  htole32(120) : htole32(0);
+    const uint32_t maxOut = timeout;
+#endif
+
+    if (!scanActive)
+        gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FORCE_PASSIVE;
+    gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_PASS_ALL |
+        IWX_UMAC_SCAN_GEN_FLAGS_V2_ADAPTIVE_DWELL;
+#ifdef AIRPORT_WCL
+    if (timing.fragmented) {
+        gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FRAGMENTED_LMAC1;
+        general_params->num_of_fragments[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+        if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT)) {
+            gen_flags |= IWX_UMAC_SCAN_GEN_FLAGS_V2_FRAGMENTED_LMAC2;
+            general_params->num_of_fragments[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_NUM_OF_FRAGS;
+        }
+    }
+#endif
+    general_params->flags = htole16(gen_flags);
+
+    general_params->adwell_default_social_chn =
+        IWX_SCAN_ADWELL_DEFAULT_N_APS_SOCIAL;
+    general_params->adwell_default_2g = IWX_SCAN_ADWELL_DEFAULT_LB_N_APS;
+    general_params->adwell_default_5g = IWX_SCAN_ADWELL_DEFAULT_HB_N_APS;
+    general_params->adwell_max_budget = cpu_to_le16(directed ?
+        IWX_SCAN_ADWELL_MAX_BUDGET_DIRECTED_SCAN :
+        IWX_SCAN_ADWELL_MAX_BUDGET_FULL_SCAN);
+
+    general_params->scan_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
+    general_params->max_out_of_time[IWX_SCAN_LB_LMAC_IDX] = maxOut;
+    general_params->suspend_time[IWX_SCAN_LB_LMAC_IDX] = timeout;
+    if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_CDB_SUPPORT)) {
+        general_params->max_out_of_time[IWX_SCAN_HB_LMAC_IDX] = maxOut;
+        general_params->suspend_time[IWX_SCAN_HB_LMAC_IDX] = timeout;
+    }
+
+    general_params->active_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_ACTIVE;
+    general_params->passive_dwell[IWX_SCAN_LB_LMAC_IDX] = IWL_SCAN_DWELL_PASSIVE;
+    general_params->active_dwell[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_DWELL_ACTIVE;
+    general_params->passive_dwell[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_DWELL_PASSIVE;
+}
+
+int ItlIwx::
+iwx_umac_scan_v17(struct iwx_softc *sc, int bgscan)
+{
+    XYLog("%s\n", __FUNCTION__);
+    struct ieee80211com *ic = &sc->sc_ic;
+    sc->sc_scan_batch_sent = 0;
+    int scanSSIDLength = ic->ic_des_esslen;
+    const uint8_t *scanSSID = ic->ic_des_essid;
+    bool scanActive = scanSSIDLength != 0 && !bgscan;
+#ifdef AIRPORT_WCL
+    scanActive = AirportWCL::scanUsesProbes(ic->ic_wcl_scan_requested,
+        ic->ic_wcl_scan_active);
+    if (ic->ic_wcl_scan_requested) {
+        scanSSIDLength = ic->ic_wcl_scan_ssid_length;
+        scanSSID = ic->ic_wcl_scan_ssid;
+    }
+#endif
+    int err = 0, async = bgscan;
+    struct iwx_api86_scan_req *req;
+    size_t req_len;
+    struct iwx_api86_scan_channels *cp;
+    struct iwx_host_cmd hcmd = {
+        .id = iwx_cmd_id(IWX_SCAN_REQ_UMAC, IWX_LONG_GROUP, 0),
+        .len = { 0, },
+        .data = { NULL, },
+        .flags = 0,
+    };
+    
+    req_len = sizeof(*req);
+    req = (struct iwx_api86_scan_req *)malloc(req_len, 0,
+                                             (async ? M_NOWAIT : M_WAITOK) | M_ZERO);
+    if (req == NULL)
+        return ENOMEM;
+    
+    hcmd.len[0] = (uint16_t)req_len;
+    hcmd.data[0] = (void *)req;
+    hcmd.flags |= async ? IWX_CMD_ASYNC : 0;
+
+    req->ooc_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
+    iwx_umac_scan_v17_fill_general(sc, &req->scan_params.general_params,
+        bgscan, scanActive, scanActive && scanSSIDLength != 0);
+
+
+    /* Specify the scan plan: We'll do one iteration. */
+    req->scan_params.periodic_params.schedule[0].interval = 0;
+    req->scan_params.periodic_params.schedule[0].iter_count = 1;
+    
+    err = iwx_fill_probe_req(sc, &req->scan_params.probe_params.preq);
+    if (err) {
+        ::free(req);
+        return err;
+    }
+    cp = &req->scan_params.channel_params;
+    cp->flags = IWX_SCAN_CHANNEL_FLAG_ENABLE_CHAN_ORDER;
+#ifdef AIRPORT_WCL
+    bool explicitWclChannels = ic->ic_wcl_scan_restricted &&
+        (ic->ic_wcl_scan_requested || (ic->ic_wcl_join_requested && !bgscan));
+    if (scanSSIDLength == 0)
+        cp->flags |= IWX_SCAN_CHANNEL_FLAG_6G_PSC_NO_FILTER;
+    if (explicitWclChannels) {
+        /*
+         * A restricted request whose channels are all missing from the
+         * active set would program an empty scan. iwx_umac_scan() reads
+         * that as a failure, and the caller answers it by restarting the
+         * firmware, which takes the interface away from every join issued
+         * in the following seconds. Scan the full set instead: its results
+         * are a superset of what was requested.
+         */
+        bool selected = false;
+        for (int i = 1; !selected && i <= IEEE80211_CHAN_MAX; i++) {
+            const auto c = &ic->ic_channels[i];
+            if (!isset(ic->ic_chan_active, i) || !c->ic_freq || !c->ic_flags)
+                continue;
+            if (!IEEE80211_IS_CHAN_2GHZ(c) && !IEEE80211_IS_CHAN_5GHZ(c) &&
+                !IEEE80211_IS_CHAN_6GHZ(c))
+                continue;
+            selected = AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
+                ic->ic_wcl_scan_channels6GHz, IEEE80211_IS_CHAN_6GHZ(c), true,
+                ieee80211_chan2number(ic, c));
+        }
+        if (!selected) {
+            explicitWclChannels = false;
+        }
+    }
+    /*
+     * See AirportWCL::scanBandRestricted: the framework builds its channel list
+     * from the cache this driver reported, and 6 GHz only enters that cache
+     * once the regulatory domain settles. Treating an empty 6 GHz list as "do
+     * not scan 6 GHz" is what keeps the whole band out of the Wi-Fi menu;
+     * upstream never decoded a 6 GHz list, so its restriction could not exclude
+     * the band at all.
+     */
+    const bool restrict6GHz = AirportWCL::scanBandRestricted(
+        ic->ic_wcl_scan_channels6GHz, explicitWclChannels,
+        ic->ic_wcl_join_requested || ic->ic_wcl_scan_ssid_length != 0);
+#endif
+    const uint8_t channelLimit = MIN(nitems(cp->channel_config),
+                                     sc->sc_capa_n_scan_channels);
+    uint16_t channelIndex = sc->sc_scan_next_channel;
+    const bool firstBatch = channelIndex == 1;
+    bool hasLegacyChannel = false;
+#ifdef AIRPORT_WCL
+    const bool directedJoin = explicitWclChannels && ic->ic_wcl_join_requested &&
+        !bgscan && !IEEE80211_IS_MULTICAST(ic->ic_des_bssid);
+    auto *probe = &req->scan_params.probe_params;
+    uint8_t rnrProbeChannels[IWX_SCAN_SHORT_SSID_MAX_SIZE] = {};
+    uint8_t rnrProbeCount = 0;
+    if (scanActive && ic->ic_wcl_scan_requested && !directedJoin) {
+        const uint32_t requestedShortSsid = scanSSIDLength != 0 ?
+            AirportWCL::shortSsid(scanSSID, scanSSIDLength) : 0;
+        for (uint8_t hint = 0; hint < ic->ic_wcl_scan_rnr_count; ++hint) {
+            const uint32_t shortSsid = ic->ic_wcl_scan_rnr_short_ssid[hint];
+            const uint8_t hintChannel = ic->ic_wcl_scan_rnr_channel[hint];
+            if (scanSSIDLength != 0 && shortSsid != requestedShortSsid)
+                continue;
+            const unsigned hintIndex = ieee80211_ieee2chanidx(
+                ic, hintChannel, IEEE80211_CHAN_6GHZ);
+            if (hintIndex == 0 || !ic->ic_channels[hintIndex].ic_freq ||
+                !isset(ic->ic_chan_active, hintIndex) ||
+                !AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
+                    ic->ic_wcl_scan_channels6GHz, true, explicitWclChannels,
+                    hintChannel))
+                continue;
+            if (rnrProbeCount >= IWX_SCAN_SHORT_SSID_MAX_SIZE)
+                break;
+            probe->short_ssid[rnrProbeCount] = htole32(shortSsid);
+            memcpy(probe->bssid_array[rnrProbeCount],
+                ic->ic_wcl_scan_rnr_bssid[hint], ETHER_ADDR_LEN);
+            rnrProbeChannels[rnrProbeCount] = hintChannel;
+            ++rnrProbeCount;
+        }
+        probe->short_ssid_num = rnrProbeCount;
+        probe->bssid_num = rnrProbeCount;
+    }
+#endif
+    int batchBand = -1;
+    for (; channelIndex <= IEEE80211_CHAN_MAX; channelIndex++) {
+        auto c = &ic->ic_channels[channelIndex];
+        if (!isset(ic->ic_chan_active, channelIndex) || !c->ic_freq || !c->ic_flags)
+            continue;
+        /* Scan for the other MLD links: those channels only, 6 GHz non-PSC included. */
+        if (sc->sc_scan_mlo && !isset(sc->sc_scan_mlo_chans, channelIndex))
+            continue;
+        bool is6GHz = IEEE80211_IS_CHAN_6GHZ(c);
+        bool is2GHz = IEEE80211_IS_CHAN_2GHZ(c);
+        bool is5GHz = IEEE80211_IS_CHAN_5GHZ(c);
+        uint8_t channelNumber = ieee80211_chan2number(ic, c);
+#ifdef AIRPORT_WCL
+        uint32_t rnrBssidBitmap = 0;
+        uint32_t rnrShortSsidBitmap = 0;
+        for (uint8_t hint = 0; hint < rnrProbeCount; ++hint) {
+            if (rnrProbeChannels[hint] != channelNumber)
+                continue;
+            rnrBssidBitmap |= 1U << hint;
+            rnrShortSsidBitmap |= 1U << hint;
+        }
+        const bool rnrTarget = rnrBssidBitmap != 0;
+        /* Match Linux's no-SSID passive scan and cached-RNR channel policy. */
+        const bool trimToPsc = scanActive && !directedJoin && !sc->sc_scan_mlo;
+
+        if (is6GHz && !AirportWCL::is6GHzPsc(channelNumber) && !rnrTarget &&
+            trimToPsc)
+            continue;
+#endif
+        if (!is2GHz && !is5GHz && !is6GHz)
+            continue;
+#ifdef AIRPORT_WCL
+        if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
+                ic->ic_wcl_scan_channels6GHz, is6GHz,
+                is6GHz ? restrict6GHz : explicitWclChannels, channelNumber))
+            continue;
+#endif
+        int channelBand = is6GHz ? 1 : 0;
+        if (cp->count && batchBand != channelBand)
+            break;
+        if (cp->count >= channelLimit)
+            break;
+        batchBand = channelBand;
+        auto channel = &cp->channel_config[cp->count++];
+        uint32_t band = is6GHz ? IWX_PHY_BAND_6 :
+            is2GHz ? IWX_PHY_BAND_24 : IWX_PHY_BAND_5;
+        uint32_t channelFlags = band << 30;
+        if (is6GHz) {
+#ifdef AIRPORT_WCL
+            /*
+             * Linux decides this from the scan's own hints and never from the
+             * channel's flag: a 6 GHz channel is scanned actively when an RNR
+             * entry points at it or when it is a PSC channel, and passively
+             * only when it has neither (scan.c,
+             * iwl_mvm_umac_scan_cfg_channels_v7_6g). The PASSIVE bit here is
+             * the NVM's per-channel ACTIVE flag, a property of the chip rather
+             * than of the regulatory domain, so consulting it made every 6 GHz
+             * dwell passive - and a 6 GHz network whose beacon carries an empty
+             * SSID then never answered a probe, so its name never arrived.
+             */
+            const bool activePsc = scanActive &&
+                AirportWCL::is6GHzPsc(channelNumber);
+            const bool targetBssid = directedJoin;
+            const bool active6GHz = scanActive &&
+                (activePsc || targetBssid || rnrTarget);
+            if (active6GHz) {
+                if (rnrTarget)
+                    channelFlags |= rnrBssidBitmap |
+                        (rnrShortSsidBitmap << 16);
+                if (activePsc && scanSSIDLength != 0) {
+                    channelFlags |= 1U << 16;
+                    if (!rnrProbeCount) {
+                        probe->short_ssid[0] = htole32(
+                            AirportWCL::shortSsid(scanSSID, scanSSIDLength));
+                        probe->short_ssid_num = 1;
+                    }
+                }
+                if (targetBssid) {
+                    channelFlags |= 1U;
+                    memcpy(probe->bssid_array[0], ic->ic_des_bssid,
+                        sizeof(ic->ic_des_bssid));
+                    probe->bssid_num = 1;
+                }
+                if (scanSSIDLength != 0 &&
+                    isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_HIDDEN_6GHZ_SCAN)) {
+                    probe->direct_scan[0].id = IEEE80211_ELEMID_SSID;
+                    probe->direct_scan[0].len = scanSSIDLength;
+                    memcpy(probe->direct_scan[0].ssid, scanSSID, scanSSIDLength);
+                }
+            } else {
+                channelFlags |= IWX_UHB_CHAN_CFG_FLAG_FORCE_PASSIVE;
+            }
+#else
+            channelFlags |= IWX_UHB_CHAN_CFG_FLAG_FORCE_PASSIVE;
+#endif
+        } else {
+            hasLegacyChannel = true;
+#ifdef AIRPORT_WCL
+            // v17 selects the SSID here; firmware applies channel permissions and passive-to-active transitions.
+            if (scanActive)
+#else
+            if (scanActive && !bgscan)
+#endif
+                channelFlags |= 1;
+        }
+        channel->flags = htole32(channelFlags);
+        channel->channel_num = channelNumber;
+        channel->psd_20 = 0x80;
+        channel->iter_count = 1;
+        channel->iter_interval = 0;
+    }
+    sc->sc_scan_next_channel = channelIndex;
+    if (!cp->count) {
+        if (firstBatch) {
+            unsigned active = 0;
+
+            for (unsigned i = 1; i <= IEEE80211_CHAN_MAX; i++)
+                if (isset(ic->ic_chan_active, i) && ic->ic_channels[i].ic_freq &&
+                    ic->ic_channels[i].ic_flags)
+                    active++;
+            XYLog("%s: nothing to scan: %u active channels, channel limit %u, "
+                "scan %d join %d restricted %d bgscan %d mlo %d\n", __FUNCTION__,
+                active, channelLimit, ic->ic_wcl_scan_requested,
+                ic->ic_wcl_join_requested, ic->ic_wcl_scan_restricted, bgscan,
+                sc->sc_scan_mlo);
+        }
+        ::free(req);
+        return 0;
+    }
+    if (scanActive && hasLegacyChannel) {
+        req->scan_params.probe_params.direct_scan[0].id = IEEE80211_ELEMID_SSID;
+        req->scan_params.probe_params.direct_scan[0].len = scanSSIDLength;
+        memcpy(req->scan_params.probe_params.direct_scan[0].ssid, scanSSID,
+               scanSSIDLength);
+    }
+    cp->n_aps_override[0] = IWX_SCAN_ADWELL_N_APS_GO_FRIENDLY;
+    cp->n_aps_override[1] = IWX_SCAN_ADWELL_N_APS_SOCIAL_CHS;
+
+    sc->sc_scan_batch_sent = 1;
+    sc->sc_scan_batch_pending = 1;
+#ifdef AIRPORT_WCL
+    if (ic->ic_wcl_scan_requested && scanSSIDLength != 0) {
+        for (unsigned i = 0; i < cp->count; ++i) {
+            auto channel = &cp->channel_config[i];
+            if (channel->channel_num != 149 || (le32toh(channel->flags) >> 30) != IWX_PHY_BAND_5)
+                continue;
+            auto wh = reinterpret_cast<struct ieee80211_frame *>(req->scan_params.probe_params.preq.buf);
+            char state[352];
+            struct timeval now;
+            getmicrouptime(&now);
+            snprintf(state, sizeof(state),
+                "uptime=%ld.%06d gen=%d scanGen=%u batch=%u channels=%u active=%u ssidLen=%d "
+                "channel149flags=0x%x hostflags=0x%x source=%s general=0x%x bg=%d cmdver=%u",
+                (long)now.tv_sec, (int)now.tv_usec, sc->sc_generation, sc->sc_scan_generation,
+                sc->sc_scan_batch, cp->count, scanActive, scanSSIDLength, le32toh(channel->flags),
+                ic->ic_channels[149].ic_flags, ether_sprintf(wh->i_addr2),
+                le16toh(req->scan_params.general_params.flags), bgscan,
+                iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC));
+            auto previous = OSDynamicCast(OSData, sc->sc_pcitag->getProperty("AirportItlwm-HotspotScanSSID"));
+            auto direct = &req->scan_params.probe_params.direct_scan[0];
+            const bool newTarget = !previous || previous->getLength() != direct->len ||
+                memcmp(previous->getBytesNoCopy(), direct->ssid, direct->len) != 0;
+            // Arm on the hotspot's single-channel request and retain that target for this boot.
+            if ((previous && newTarget) || (!previous &&
+                (cp->count != 1 || !ic->ic_wcl_scan_restricted)))
+                continue;
+            sc->sc_pcitag->setProperty("AirportItlwm-HotspotScanState", state);
+            sc->sc_pcitag->setProperty("AirportItlwm-HotspotScanSSID",
+                req->scan_params.probe_params.direct_scan[0].ssid,
+                (unsigned)req->scan_params.probe_params.direct_scan[0].len);
+            sc->sc_pcitag->setProperty("AirportItlwm-HotspotScanRequest", req, (unsigned)req_len);
+            if (!sc->sc_pcitag->getProperty("AirportItlwm-HotspotScanFirstRequest")) {
+                sc->sc_pcitag->setProperty("AirportItlwm-HotspotScanFirstState", state);
+                sc->sc_pcitag->setProperty("AirportItlwm-HotspotScanFirstRequest", req, (unsigned)req_len);
+            }
+            break;
+        }
+    }
+#endif
+    err = iwx_send_cmd(sc, &hcmd);
+    if (err)
+        sc->sc_scan_batch_pending = 0;
+    ::free(req);
+    return err;
+}

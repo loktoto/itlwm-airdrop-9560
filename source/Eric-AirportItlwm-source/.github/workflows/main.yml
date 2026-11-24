@@ -1,0 +1,81 @@
+name: BE200 Tahoe build
+
+on:
+  push:
+    branches: [be200-tahoe]
+    paths:
+      - 'itlwm/**'
+      - 'itl80211/**'
+      - 'AirportItlwm/**'
+      - 'include/**'
+      - 'itlwm.xcodeproj/**'
+      - 'scripts/**'
+      - '.github/workflows/main.yml'
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode build configuration
+        type: choice
+        required: true
+        default: Debug
+        options: [Debug, Release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: be200-tahoe-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned MacKernelSDK
+        uses: actions/checkout@v4
+        with:
+          repository: acidanthera/MacKernelSDK
+          ref: 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+          path: MacKernelSDK
+      - name: Expose public Tahoe MSI-X API
+        run: python3 scripts/prepare_tahoe_sdk.py
+      - name: Build Tahoe and Sequoia x86_64 kexts
+        env:
+          CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+        run: |
+          set -euo pipefail
+          mkdir -p logs artifacts
+          xcodebuild -version > logs/toolchain.txt
+          git rev-parse HEAD > logs/source-commit.txt
+          for platform in Tahoe Sequoia; do
+            xcodebuild -project itlwm.xcodeproj -target "AirportItlwm-$platform" \
+              -configuration "$CONFIGURATION" -jobs 3 ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO \
+              SYMROOT="$PWD/build/products" OBJROOT="$PWD/build/obj" \
+              CODE_SIGNING_ALLOWED=NO \
+              build > "logs/build-$platform.txt" 2>&1 || {
+                grep -n -A3 -B2 'error:' "logs/build-$platform.txt" || true
+                tail -30 "logs/build-$platform.txt"
+                exit 1
+              }
+            product="$PWD/build/products/$CONFIGURATION/$platform/AirportItlwm.kext"
+            dwarfdump --uuid "$product/Contents/MacOS/AirportItlwm" > "artifacts/UUID-$platform.txt"
+            ditto -c -k --keepParent "$product" "artifacts/AirportItlwm-$platform.zip"
+          done
+          cp logs/source-commit.txt artifacts/
+          cp LICENSE iwlwifi-firmware-license BE200.md artifacts/
+      - name: Upload compiler logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.sha }}
+          path: logs/
+          retention-days: 7
+      - name: Upload experimental build
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirportItlwm-Tahoe-Sequoia-${{ inputs.configuration || 'Debug' }}-${{ github.sha }}
+          path: artifacts/
+          retention-days: 7
+          if-no-files-found: error

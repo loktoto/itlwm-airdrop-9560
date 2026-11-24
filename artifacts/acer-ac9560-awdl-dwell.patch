@@ -1,0 +1,503 @@
+diff --git a/AirportItlwm/AirportItlwmAWDLInterface.cpp b/AirportItlwm/AirportItlwmAWDLInterface.cpp
+index d38db52..423ffb1 100644
+--- a/AirportItlwm/AirportItlwmAWDLInterface.cpp
++++ b/AirportItlwm/AirportItlwmAWDLInterface.cpp
+@@ -879,6 +879,7 @@ stopAWTimeline()
+     if (fListenTimer)
+         fListenTimer->cancelTimeout();
+     fTxPending = 0;
++    fTxDwellEndUs = 0;
+     if (fTxTimer)
+         fTxTimer->cancelTimeout();
+     // Nothing can leave without the timeline; do not send stale frames later.
+@@ -916,6 +917,7 @@ teardownAW()
+         OSSafeReleaseNULL(fListenTimer);
+     }
+     fTxPending = 0;
++    fTxDwellEndUs = 0;
+     while (fDataQCount) {
+         mbuf_freem(fDataQ[fDataQHead]);
+         fDataQ[fDataQHead] = nullptr;
+@@ -1626,7 +1628,8 @@ listenTimerFired(OSObject *owner, IOTimerEventSource *)
+             if (that->fListenStarted != before) {
+                 if (awDataAllowed())
+                     that->fListenOwn++;
+-                that->scheduleTx(that->fListenNextChan, now + kListenLeadUs);
++                that->scheduleTx(that->fListenNextChan, now + kListenLeadUs,
++                    now + (uint64_t)dwell * 1024);
+             }
+         }
+     }
+@@ -1643,6 +1646,7 @@ listenTimerFired(OSObject *owner, IOTimerEventSource *)
+ static const uint8_t kAWDLBssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+ static const uint32_t kTxPSFAtUs = 1000;
+ static const uint32_t kTxDataAtUs = 4000;
++static const uint32_t kTxDataDwellGuardUs = 2000;
+ enum : uint8_t {
+     kTxPendingPSF = 1 << 0,
+     kTxPendingData = 1 << 1,
+@@ -1652,8 +1656,9 @@ enum : uint8_t {
+ };
+ 
+ void AirportItlwmAWDLInterface::
+-scheduleTx(uint8_t chan, uint64_t slotStartUs)
++scheduleTx(uint8_t chan, uint64_t slotStartUs, uint64_t dwellEndUs)
+ {
++    fTxDwellEndUs = 0;
+     if (!awTxAllowed() || !fTxTimer || !fAWRunning)
+         return;
+     if (fAfTxMode == 3) {
+@@ -1662,6 +1667,7 @@ scheduleTx(uint8_t chan, uint64_t slotStartUs)
+     }
+     fTxChan = chan;
+     fTxSlotUs = slotStartUs;
++    fTxDwellEndUs = dwellEndUs;
+     fTxPending = kTxPendingPSF | kTxPendingData;
+     if (fMITmplLen && fChanSeqValid) {
+         const uint32_t count = fChanSeq[kChanSeqCount];
+@@ -1898,6 +1904,22 @@ enqueueData(mbuf_t m)
+     fDataQ[(fDataQHead + fDataQCount) % kDataQueueLen] = m;
+     fDataQCount++;
+     fDataTxQueued++;
++
++    // The timed flush already serves bursts queued at the start of a slot.
++    // If one packet arrives later (often a TCP ACK), use the remainder of
++    // the current common dwell without changing the radio's schedule.
++    if (fDataQCount != 1 || !fAWRunning || !fTxDwellEndUs ||
++        (fTxPending & kTxPendingData) || fAfTxMode == 3)
++        return;
++    const uint64_t now = hostUs();
++    if (now < fTxSlotUs + kTxDataAtUs || now + kTxDataDwellGuardUs >= fTxDwellEndUs ||
++        !fTxChan || now - fPeerSeenUs > kPeerStaleUs ||
++        peerChannelAt(now) != fTxChan ||
++        peerChannelAt(now + kTxDataDwellGuardUs) != fTxChan)
++        return;
++    const uint64_t sent = fDataTx;
++    flushData();
++    fDataTxWithinDwell += fDataTx - sent;
+ }
+ 
+ // Ethernet -> 802.11 data (no QoS) + LLC/SNAP 00:17:f2 0x0800 + AWDL data
+@@ -1939,9 +1961,9 @@ flushData()
+             a[6] = eh[12]; a[7] = eh[13];
+             mbuf_copydata(m, 14, plen - 14, a + ad);
+             int err = ic->ic_awdl_tx(ic, fTxChan, frame, hdr + llc + ad + plen - 14);
+-            if (err == EAGAIN) {
++            if (err == EAGAIN || err == EBUSY || err == ENOBUFS) {
+                 fDataTxDeferred++;
+-                return;             // keep it for the next dwell
++                return;             // keep the original Ethernet packet for the next dwell
+             }
+             if (err) {
+                 fDataTxErr++;
+@@ -1965,7 +1987,7 @@ enqueueLowLatencyData(mbuf_t m)
+ {
+     if (!m)
+         return;
+-    if (fLowLatencyDataQCount >= kDataQueueLen) {
++    if (fLowLatencyDataQCount >= kLowLatencyDataQueueLen) {
+         auto *llw = fController ? fController->fLLWBsdIf : nullptr;
+         ifnet_t llwIfp = llw ? llw->getIfnet() : nullptr;
+         if (llwIfp)
+@@ -1973,7 +1995,7 @@ enqueueLowLatencyData(mbuf_t m)
+         mbuf_freem(m);
+         return;
+     }
+-    fLowLatencyDataQ[(fLowLatencyDataQHead + fLowLatencyDataQCount) % kDataQueueLen] = m;
++    fLowLatencyDataQ[(fLowLatencyDataQHead + fLowLatencyDataQCount) % kLowLatencyDataQueueLen] = m;
+     fLowLatencyDataQCount++;
+ }
+ 
+@@ -1983,7 +2005,7 @@ clearLowLatencyData()
+     while (fLowLatencyDataQCount) {
+         mbuf_freem(fLowLatencyDataQ[fLowLatencyDataQHead]);
+         fLowLatencyDataQ[fLowLatencyDataQHead] = nullptr;
+-        fLowLatencyDataQHead = (fLowLatencyDataQHead + 1) % kDataQueueLen;
++        fLowLatencyDataQHead = (fLowLatencyDataQHead + 1) % kLowLatencyDataQueueLen;
+         fLowLatencyDataQCount--;
+     }
+ }
+@@ -2045,7 +2067,7 @@ flushLowLatencyData()
+         }
+         mbuf_freem(m);
+         fLowLatencyDataQ[fLowLatencyDataQHead] = nullptr;
+-        fLowLatencyDataQHead = (fLowLatencyDataQHead + 1) % kDataQueueLen;
++        fLowLatencyDataQHead = (fLowLatencyDataQHead + 1) % kLowLatencyDataQueueLen;
+         fLowLatencyDataQCount--;
+     }
+ }
+@@ -2063,6 +2085,7 @@ publishDataState()
+     setProperty("AWDLDataTxQueued", fDataTxQueued, 64);
+     setProperty("AWDLDataTxDropFull", fDataTxDropFull, 64);
+     setProperty("AWDLDataTxDeferred", fDataTxDeferred, 64);
++    setProperty("AWDLDataTxWithinDwell", fDataTxWithinDwell, 64);
+     setProperty("AWDLDataTxErr", fDataTxErr, 64);
+     setProperty("AWDLDataTxPending", fDataQCount, 32);
+     setProperty("AWDLDataTxNotCommon", fDataTxNotCommon, 64);
+@@ -2648,6 +2671,7 @@ init(IO80211Controller *controller, ether_addr *mac, unsigned int role, char con
+     fTxMIOffsetUs = 0;
+     fTxMIBitmap = 0;
+     fTxSlotUs = 0;
++    fTxDwellEndUs = 0;
+     fTxSeq = 0;
+     fMasterChannel = 0;
+     fTxPSF = 0;
+@@ -2674,6 +2698,7 @@ init(IO80211Controller *controller, ether_addr *mac, unsigned int role, char con
+     fDataTxQueued = 0;
+     fDataTxDropFull = 0;
+     fDataTxDeferred = 0;
++    fDataTxWithinDwell = 0;
+     fDataTxErr = 0;
+     fListenOwn = 0;
+     fListenPeerSlots = 0;
+diff --git a/AirportItlwm/AirportItlwmAWDLInterface.hpp b/AirportItlwm/AirportItlwmAWDLInterface.hpp
+index 0d465dc..01997cd 100644
+--- a/AirportItlwm/AirportItlwmAWDLInterface.hpp
++++ b/AirportItlwm/AirportItlwmAWDLInterface.hpp
+@@ -305,7 +305,7 @@ private:
+     // Stage 3 step 1 (-itlawdltx): send a PSF and an MI in the peer's AW
+     // during each aligned listen dwell.
+     static void txTimerFired(OSObject *owner, IOTimerEventSource *sender);
+-    void scheduleTx(uint8_t chan, uint64_t slotStartUs);
++    void scheduleTx(uint8_t chan, uint64_t slotStartUs, uint64_t dwellEndUs);
+     void scheduleTxTimer();
+     int sendAWDLFrame(bool mi, uint8_t chan, const uint8_t *destination,
+         const uint8_t *payload, size_t payloadLen);
+@@ -328,9 +328,9 @@ public:
+     void enqueueLowLatencyData(mbuf_t m);
+     void flushLowLatencyData();
+     void clearLowLatencyData();
+-    // 32 overflowed during AirDrop (AWDLDataTxDropFull): data only
+-    // leaves in the peer's slots, so a burst from the stack has to wait.
+-    enum { kDataQueueLen = 256 };
++    // AirDrop bursts can build up across several nonmatching peer slots.
++    // Bound the backlog while giving the stack room to span those gaps.
++    enum { kDataQueueLen = 512, kLowLatencyDataQueueLen = 256 };
+     mbuf_t fDataQ[kDataQueueLen];
+     unsigned fDataQHead;
+     unsigned fDataQCount;
+@@ -340,7 +340,8 @@ public:
+     uint64_t fDataTxDropFull;
+     uint64_t fDataTxDeferred;
+     uint64_t fDataTxErr;
+-    mbuf_t fLowLatencyDataQ[kDataQueueLen];
++    uint64_t fDataTxWithinDwell;
++    mbuf_t fLowLatencyDataQ[kLowLatencyDataQueueLen];
+     unsigned fLowLatencyDataQHead;
+     unsigned fLowLatencyDataQCount;
+     uint16_t fLowLatencySeq;
+@@ -352,6 +353,7 @@ private:
+     uint32_t fTxMIBitmap;
+     uint8_t fTxMISlot;
+     uint64_t fTxSlotUs;
++    uint64_t fTxDwellEndUs;
+     uint16_t fTxSeq;                // 802.11 sequence number
+     uint32_t fMasterChannel;        // setAWDL_MASTER_CHANNEL
+     uint64_t fTxPSF;
+diff --git a/itlwm/hal_iwm/ItlIwm.hpp b/itlwm/hal_iwm/ItlIwm.hpp
+index 04bc607..633a8bc 100644
+--- a/itlwm/hal_iwm/ItlIwm.hpp
++++ b/itlwm/hal_iwm/ItlIwm.hpp
+@@ -338,6 +338,8 @@ public:
+     int    iwm_awdl_binding_cmd(struct iwm_softc *, uint32_t);
+     int    iwm_awdl_add_sta(struct iwm_softc *);
+     int    iwm_awdl_remove_sta(struct iwm_softc *);
++    int    iwm_awdl_configure_tx_queues(struct iwm_softc *, bool);
++    int    iwm_awdl_install_sta(struct iwm_softc *, int &);
+     void    iwm_awdl_listener_reset(struct iwm_softc *);
+     void    iwm_awdl_clear_keys(struct iwm_softc *);
+     int    iwm_flush_tx_path(struct iwm_softc *, int);
+diff --git a/itlwm/hal_iwm/if_iwmvar.h b/itlwm/hal_iwm/if_iwmvar.h
+index 3b830b5..9e31c50 100644
+--- a/itlwm/hal_iwm/if_iwmvar.h
++++ b/itlwm/hal_iwm/if_iwmvar.h
+@@ -715,6 +715,8 @@ struct iwm_softc {
+     int sc_awdl_data_qid;
+     int sc_awdl_listener_chan;
+     int sc_awdl_listener_tries;
++    bool sc_awdl_programming_station;
++    bool sc_awdl_fw_fault;
+     int sc_awdl_addr_gen;
+     int sc_awdl_encryption_type;
+     int sc_awdl_low_latency;
+diff --git a/itlwm/hal_iwm/mac80211.cpp b/itlwm/hal_iwm/mac80211.cpp
+index 7540fcd..d9207f4 100644
+--- a/itlwm/hal_iwm/mac80211.cpp
++++ b/itlwm/hal_iwm/mac80211.cpp
+@@ -2576,6 +2576,85 @@ iwm_awdl_remove_sta(struct iwm_softc *sc)
+     return iwm_send_cmd_pdu(sc, IWM_REMOVE_STA, 0, sizeof(cmd), &cmd);
+ }
+ 
++int ItlIwm::
++iwm_awdl_configure_tx_queues(struct iwm_softc *sc, bool enable)
++{
++    const int qids[] = { IWM_AWDL_MGMT_QUEUE, IWM_AWDL_DATA_QUEUE };
++    const int tids[] = { IWM_MAX_TID_COUNT, IWM_TID_NON_QOS };
++    int *const current[] = { &sc->sc_awdl_mgmt_qid, &sc->sc_awdl_data_qid };
++    const int generation = sc->sc_generation;
++    int result = 0;
++
++    if (!iwm_nic_lock(sc))
++        return EBUSY;
++    for (unsigned i = 0; i < nitems(qids); i++) {
++        const unsigned index = enable ? i : nitems(qids) - i - 1;
++        if (enable == (*current[index] >= 0))
++            continue;
++        int error;
++        if (enable) {
++            error = iwm_enable_txq(sc, IWM_AWDL_STA_ID, qids[index],
++                iwm_ac_to_tx_fifo[EDCA_AC_BE], 0, tids[index], 0);
++        } else {
++            struct iwm_scd_txq_cfg_cmd cmd = {};
++            cmd.scd_queue = *current[index];
++            cmd.enable = IWM_SCD_CFG_DISABLE_QUEUE;
++            cmd.sta_id = IWM_AWDL_STA_ID;
++            cmd.tid = tids[index];
++            error = iwm_send_cmd_pdu(sc, IWM_SCD_QUEUE_CFG, 0, sizeof(cmd), &cmd);
++        }
++        if (generation != sc->sc_generation || sc->sc_awdl_fw_fault) {
++            result = ENXIO;
++            break;
++        }
++        if (error) {
++            if (!result)
++                result = error;
++            if (enable)
++                break;
++        } else {
++            *current[index] = enable ? qids[index] : -1;
++        }
++    }
++    iwm_nic_unlock(sc);
++    return result;
++}
++
++int ItlIwm::
++iwm_awdl_install_sta(struct iwm_softc *sc, int &stage)
++{
++    if (sc->sc_awdl_fw_fault || sc->sc_awdl_programming_station)
++        return EBUSY;
++    // Firmware 46's station-type API checks the ADD_STA queue mask.
++    // Program the scheduler before advertising those queue IDs.
++    const bool queues_first = sc->sc_device_family == IWM_DEVICE_FAMILY_9000 &&
++        isset(sc->sc_ucode_api, IWM_UCODE_TLV_API_STA_TYPE);
++    const int generation = sc->sc_generation;
++    int error = 0;
++
++    sc->sc_awdl_programming_station = true;
++    if (queues_first) {
++        stage = 5;
++        error = iwm_awdl_configure_tx_queues(sc, true);
++    }
++    if (!error && sc->sc_awdl_fw_fault)
++        error = ENXIO;
++    if (!error) {
++        stage = 4;
++        error = iwm_awdl_add_sta(sc);
++        if (generation != sc->sc_generation || sc->sc_awdl_fw_fault)
++            error = ENXIO;
++        if (!error)
++            sc->sc_awdl_sta_up = 1;
++    }
++    if (!error && !queues_first) {
++        stage = 5;
++        error = iwm_awdl_configure_tx_queues(sc, true);
++    }
++    sc->sc_awdl_programming_station = false;
++    return error;
++}
++
+ int ItlIwm::
+ iwm_awdl_peer_apply(struct iwm_softc *sc, const uint8_t *peer, int valid)
+ {
+@@ -2585,8 +2664,11 @@ iwm_awdl_peer_apply(struct iwm_softc *sc, const uint8_t *peer, int valid)
+     uint8_t old_peer[ETHER_ADDR_LEN];
+     const uint32_t queue_mask = (1U << IWM_AWDL_MGMT_QUEUE) |
+         (1U << IWM_AWDL_DATA_QUEUE);
+-    int err;
++    const int generation = sc->sc_generation;
++    int err, stage = 0;
+ 
++    if (sc->sc_awdl_fw_fault || sc->sc_awdl_programming_station)
++        return EBUSY;
+     if (valid && !peer)
+         return EINVAL;
+     if (valid == old_valid &&
+@@ -2607,46 +2689,6 @@ iwm_awdl_peer_apply(struct iwm_softc *sc, const uint8_t *peer, int valid)
+                        sizeof(sc->sc_awdl_node->in_ni.ni_macaddr));
+         }
+     };
+-    auto queue_config = [this, sc](int enable) {
+-        const int qids[] = { IWM_AWDL_MGMT_QUEUE, IWM_AWDL_DATA_QUEUE };
+-        const int tids[] = { IWM_MAX_TID_COUNT, IWM_TID_NON_QOS };
+-        int err = 0;
+-        if (!iwm_nic_lock(sc))
+-            return EBUSY;
+-        for (int i = 0; i < nitems(qids); i++) {
+-            int *stored_qid = i == 0 ? &sc->sc_awdl_mgmt_qid :
+-                &sc->sc_awdl_data_qid;
+-            if (enable) {
+-                err = iwm_enable_txq(sc, IWM_AWDL_STA_ID, qids[i],
+-                    iwm_ac_to_tx_fifo[EDCA_AC_BE], 0, tids[i], 0);
+-                if (err)
+-                    break;
+-                *stored_qid = qids[i];
+-            } else if (*stored_qid >= 0) {
+-                struct iwm_scd_txq_cfg_cmd cmd = {};
+-                cmd.scd_queue = *stored_qid;
+-                cmd.enable = IWM_SCD_CFG_DISABLE_QUEUE;
+-                cmd.sta_id = IWM_AWDL_STA_ID;
+-                cmd.tid = tids[i];
+-                err = iwm_send_cmd_pdu(sc, IWM_SCD_QUEUE_CFG, 0,
+-                    sizeof(cmd), &cmd);
+-                if (err)
+-                    break;
+-                *stored_qid = -1;
+-            }
+-        }
+-        iwm_nic_unlock(sc);
+-        return err;
+-    };
+-    auto restore_old = [&]() {
+-        set_peer(old_peer, old_valid);
+-        int restore_err = iwm_awdl_add_sta(sc);
+-        if (restore_err)
+-            return restore_err;
+-        sc->sc_awdl_sta_up = 1;
+-        return queue_config(1);
+-    };
+-
+     set_peer(peer, valid);
+     if (!sc->sc_awdl_listener_up || !sc->sc_awdl_sta_up || !in)
+         return 0;
+@@ -2666,14 +2708,16 @@ iwm_awdl_peer_apply(struct iwm_softc *sc, const uint8_t *peer, int valid)
+             goto restore_active;
+     }
+ 
+-    err = queue_config(0);
++    err = iwm_awdl_configure_tx_queues(sc, false);
+     if (err) {
+         iwm_awdl_listener_reset(sc);
+         return err;
+     }
+     err = iwm_awdl_remove_sta(sc);
+     if (err) {
+-        if (queue_config(1)) {
++        if (sc->sc_awdl_fw_fault || generation != sc->sc_generation)
++            return err;
++        if (iwm_awdl_configure_tx_queues(sc, true)) {
+             iwm_awdl_listener_reset(sc);
+             return err;
+         }
+@@ -2681,17 +2725,15 @@ iwm_awdl_peer_apply(struct iwm_softc *sc, const uint8_t *peer, int valid)
+     }
+     sc->sc_awdl_sta_up = 0;
+ 
+-    err = iwm_awdl_add_sta(sc);
+-    if (!err) {
+-        sc->sc_awdl_sta_up = 1;
+-        err = queue_config(1);
+-    }
++    err = iwm_awdl_install_sta(sc, stage);
+     if (!err) {
+         sc->sc_awdl_listener_active = was_active;
+         return 0;
+     }
+ 
+-    if (queue_config(0)) {
++    if (sc->sc_awdl_fw_fault || generation != sc->sc_generation)
++        return err;
++    if (iwm_awdl_configure_tx_queues(sc, false)) {
+         iwm_awdl_listener_reset(sc);
+         return err;
+     }
+@@ -2703,11 +2745,14 @@ iwm_awdl_peer_apply(struct iwm_softc *sc, const uint8_t *peer, int valid)
+         }
+         sc->sc_awdl_sta_up = 0;
+     }
+-    if (restore_old()) {
++    set_peer(old_peer, old_valid);
++    if (iwm_awdl_install_sta(sc, stage)) {
+         iwm_awdl_listener_reset(sc);
+         return err;
+     }
+ restore_active:
++    if (generation != sc->sc_generation)
++        return ENXIO;
+     set_peer(old_peer, old_valid);
+     sc->sc_awdl_listener_active = was_active;
+     return err;
+@@ -2875,7 +2920,7 @@ iwm_awdl_listener_reset(struct iwm_softc *sc)
+     struct ieee80211com *ic = &sc->sc_ic;
+     const int generation = sc->sc_generation;
+     const bool can_send = !(sc->sc_flags & (IWM_FLAG_SHUTDOWN | IWM_FLAG_HW_ERR)) &&
+-        sc->sc_awdl_generation == generation;
++        sc->sc_awdl_generation == generation && !sc->sc_awdl_fw_fault;
+     int cleanup_err = 0;
+     bool queues_safe = true;
+ 
+@@ -3096,31 +3141,7 @@ iwm_awdl_listener_setup(struct iwm_softc *sc, uint8_t chan)
+         goto fail;
+     }
+ 
+-    stage = 4;
+-    err = iwm_awdl_add_sta(sc);
+-    if (err)
+-        goto fail;
+-    sc->sc_awdl_sta_up = 1;
+-    if (generation != sc->sc_generation) {
+-        err = ENXIO;
+-        goto fail;
+-    }
+-
+-    stage = 5;
+-    if (!iwm_nic_lock(sc)) {
+-        err = EBUSY;
+-        goto fail;
+-    }
+-    err = iwm_enable_txq(sc, IWM_AWDL_STA_ID, IWM_AWDL_MGMT_QUEUE,
+-        iwm_ac_to_tx_fifo[EDCA_AC_BE], 0, IWM_MAX_TID_COUNT, 0);
+-    if (!err) {
+-        sc->sc_awdl_mgmt_qid = IWM_AWDL_MGMT_QUEUE;
+-        err = iwm_enable_txq(sc, IWM_AWDL_STA_ID, IWM_AWDL_DATA_QUEUE,
+-            iwm_ac_to_tx_fifo[EDCA_AC_BE], 0, IWM_TID_NON_QOS, 0);
+-        if (!err)
+-            sc->sc_awdl_data_qid = IWM_AWDL_DATA_QUEUE;
+-    }
+-    iwm_nic_unlock(sc);
++    err = iwm_awdl_install_sta(sc, stage);
+     if (err)
+         goto fail;
+     if (generation != sc->sc_generation) {
+@@ -3170,6 +3191,12 @@ iwm_awdl_listen(struct ieee80211com *ic, uint8_t chan, uint16_t dwell_tu)
+     (void)dwell_tu;
+     struct iwm_softc *sc = (struct iwm_softc *)IC2IFP(ic)->if_softc;
+     ItlIwm *that = container_of(sc, ItlIwm, com);
++    if (sc->sc_awdl_fw_fault) {
++        ic->ic_awdl_listener_code = ENXIO;
++        return ENXIO;
++    }
++    if (sc->sc_awdl_programming_station)
++        return EBUSY;
+     const uint8_t selected = that->iwm_awdl_listener_pick(sc);
+ 
+     if (sc->sc_flags & (IWM_FLAG_SCANNING | IWM_FLAG_BGSCAN |
+@@ -6213,6 +6240,10 @@ iwm_schedule_restart(struct iwm_softc *sc, const char *event, const char *functi
+     uint32_t detail)
+ {
+     iwm_record_diagnostic(sc, event, function, line, error, detail);
++    if (sc->sc_device_family == IWM_DEVICE_FAMILY_9000 &&
++        (sc->sc_awdl_programming_station || sc->sc_awdl_listener_up) &&
++        !strcmp(event, "fw-error"))
++        sc->sc_awdl_fw_fault = true;
+     sc->sc_restart_reason = event;
+     // kprintf never reaches the unified log; IOLog does, and restarts are rare.
+     IOLog("itlwm: %s: restart requested: %s (%s:%d) error=%d detail=0x%x\n", DEVNAME(sc), event, function, line, error, detail);
+@@ -6248,6 +6279,7 @@ iwm_publish_diagnostics(struct iwm_softc *sc)
+     sc->sc_pcitag->setProperty("AirportItlwm-DiagnosticSequence",
+         __atomic_load_n(&sc->sc_diagnostic_sequence, __ATOMIC_ACQUIRE), 32);
+     sc->sc_pcitag->setProperty("AirportItlwm-RestartCount", sc->sc_restart_count, 32);
++    sc->sc_pcitag->setProperty("AirportItlwm-AWDLFirmwareFault", sc->sc_awdl_fw_fault);
+ }
+ 
+ // The firmware keeps its own record of why it stopped. Read it before iwm_stop() powers the device down (a task, device
